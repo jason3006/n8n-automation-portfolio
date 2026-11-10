@@ -1,0 +1,1111 @@
+{
+  "name": "Jason's AI Trading Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -48,
+        -112
+      ],
+      "id": "bdc6453c-52ce-42a3-bc4c-be3ffbcb92ee",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "url": "https://newsapi.org/v2/everything",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.searchTerm }}"
+            },
+            {
+              "name": "from",
+              "value": "={{ $today.minus({ days: 2 }).toFormat('yyyy-MM-dd') }}"
+            },
+            {
+              "name": "apikey",
+              "value": "YOUR_NEWSAPI_KEY"
+            },
+            {
+              "name": "sortBy",
+              "value": "publishedAt"
+            },
+            {
+              "name": "pageSize",
+              "value": "15"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -48,
+        208
+      ],
+      "id": "17ad4534-2d09-4a4d-bd75-12cfc82e7535",
+      "name": "GETNEWS"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "claude-sonnet-4-6",
+          "mode": "list",
+          "cachedResultName": "claude-sonnet-4-6"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are a highly intelligent and accurate sentiment analyzer specializing in the financial markets.\nAnalyze the sentiment of the provided text.\n- Evaluate immediate market reaction, news impact, and technical volatility.\n- Classify the sentiment as: \"Positive\", \"Neutral\", or \"Negative\".\n- Provide a score between -1 (very negative) and 1 (very positive).\n- Give a short rationale explaining the sentiment.\nYour output must be a **JSON object** with:\n- \"category\"\n- \"score\"\n- \"rationale\"\nOnly return the JSON. Example:\n{\n \"shortTermSentiment\": {\n \"category\": \"Positive\",\n \"score\": 0.7,\n \"rationale\": \"...\"\n }\n}\nNow analyze the following text and return only the JSON:\n{{ JSON.stringify($json.articles) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [
+        176,
+        208
+      ],
+      "id": "4511872d-4dc8-4496-9ed4-8e6d90296f7d",
+      "name": "Message a model",
+      "credentials": {
+        "anthropicApi": {
+          "id": "REDACTED",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        240,
+        -80
+      ],
+      "id": "b956cdd3-9e1e-4aeb-8bb1-a7a71f20c243",
+      "name": "Aggregate"
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = items[0].json;\nconst datasets = root.data; // array of 4 Twelve Data API responses\n\nfunction findByInterval(intervalStr) {\n  const found = datasets.find(d => d.meta && d.meta.interval === intervalStr);\n  if (!found) throw new Error(`Missing dataset for interval: ${intervalStr}`);\n  return found;\n}\n\nconst raw15m  = findByInterval('15min');\nconst raw1h = findByInterval('1h');\nconst raw4h = findByInterval('4h');\nconst raw1day  = findByInterval('1day');\n\nfunction normalize(values) {\n  return values.map(v => ({\n    time: new Date(v.datetime),\n    open: parseFloat(v.open),\n    high: parseFloat(v.high),\n    low: parseFloat(v.low),\n    close: parseFloat(v.close),\n    volume: v.volume !== undefined ? parseFloat(v.volume) : null,\n  })).sort((a, b) => a.time - b.time);\n}\n\nfunction round(n, d = 5) {\n  if (n === null || n === undefined || isNaN(n)) return null;\n  const f = Math.pow(10, d);\n  return Math.round(n * f) / f;\n}\n\nfunction ema(values, period) {\n  const k = 2 / (period + 1);\n  const out = [values[0]];\n  for (let i = 1; i < values.length; i++) {\n    out.push(values[i] * k + out[i - 1] * (1 - k));\n  }\n  return out;\n}\n\nfunction rsi(candles, period = 14) {\n  if (candles.length < period + 1) return null;\n  let gains = 0, losses = 0;\n  for (let i = 1; i <= period; i++) {\n    const diff = candles[i].close - candles[i - 1].close;\n    diff >= 0 ? gains += diff : losses -= diff;\n  }\n  let avgGain = gains / period;\n  let avgLoss = losses / period;\n  for (let i = period + 1; i < candles.length; i++) {\n    const diff = candles[i].close - candles[i - 1].close;\n    const gain = diff > 0 ? diff : 0;\n    const loss = diff < 0 ? -diff : 0;\n    avgGain = (avgGain * (period - 1) + gain) / period;\n    avgLoss = (avgLoss * (period - 1) + loss) / period;\n  }\n  if (avgLoss === 0) return 100;\n  const rs = avgGain / avgLoss;\n  return round(100 - 100 / (1 + rs), 2);\n}\n\nfunction macd(candles, fast = 12, slow = 26, signal = 9) {\n  const closes = candles.map(c => c.close);\n  if (closes.length < slow + signal) return null;\n  const emaFast = ema(closes, fast);\n  const emaSlow = ema(closes, slow);\n  const macdLine = emaFast.map((v, i) => v - emaSlow[i]);\n  const signalLine = ema(macdLine, signal);\n  const histogram = macdLine.map((v, i) => v - signalLine[i]);\n  const last = macdLine.length - 1;\n  return {\n    macd: round(macdLine[last]),\n    signal: round(signalLine[last]),\n    histogram: round(histogram[last]),\n  };\n}\n\nfunction atr(candles, period = 14) {\n  if (candles.length < period + 1) return null;\n  const trs = [];\n  for (let i = 1; i < candles.length; i++) {\n    const c = candles[i], p = candles[i - 1];\n    trs.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));\n  }\n  const recent = trs.slice(-period);\n  return round(recent.reduce((a, b) => a + b, 0) / recent.length);\n}\n\nfunction vwap(candles) {\n  const hasVolume = candles.every(c => c.volume && c.volume > 0);\n  if (!hasVolume) return null; // common for forex pairs \u2014 flagged, not faked\n  let cumPV = 0, cumVol = 0;\n  candles.forEach(c => {\n    const tp = (c.high + c.low + c.close) / 3;\n    cumPV += tp * c.volume;\n    cumVol += c.volume;\n  });\n  return round(cumPV / cumVol);\n}\n\nfunction trendLabel(ema20, ema50) {\n  if (ema20 == null || ema50 == null) return \"unknown\";\n  const diffPct = ((ema20 - ema50) / ema50) * 100;\n  if (diffPct > 0.05) return \"up\";\n  if (diffPct < -0.05) return \"down\";\n  return \"sideways\";\n}\n\nfunction summarize(candles, label) {\n  if (!candles || candles.length < 30) {\n    return { timeframe: label, error: \"insufficient data\" };\n  }\n  const closes = candles.map(c => c.close);\n  const last = candles[candles.length - 1];\n  const emaFastArr = ema(closes, 20);\n  const emaSlowArr = closes.length >= 50 ? ema(closes, 50) : null;\n  const lastEma20 = emaFastArr[emaFastArr.length - 1];\n  const lastEma50 = emaSlowArr ? emaSlowArr[emaSlowArr.length - 1] : null;\n\n  return {\n    timeframe: label,\n    lastClose: round(last.close),\n    lastTime: last.time,\n    rsi14: rsi(candles, 14),\n    macd: macd(candles),\n    ema20: round(lastEma20),\n    ema50: round(lastEma50),\n    atr14: atr(candles, 14),\n    vwap: vwap(candles),\n    trend: trendLabel(lastEma20, lastEma50),\n    volumeAvailable: candles.every(c => c.volume && c.volume > 0),\n  };\n}\n\nconst candles15m  = normalize(raw15m.values);\nconst candles1h = normalize(raw1h.values);\nconst candles4h = normalize(raw4h.values);\nconst candles1day  = normalize(raw1day.values);\n\nconst rawTicker = raw15m.meta.symbol;\nconst epicCode = rawTicker.replace('/', '');\n\nreturn [{\n  json: {\n    ticker: rawTicker,\n    epicCode: epicCode,\n    indicators: {\n      \"15m\":  summarize(candles15m, \"15m\"),\n      \"1h\": summarize(candles1h, \"1h\"),\n      \"4h\": summarize(candles4h, \"4h\"),\n      \"1day\":  summarize(candles1day, \"1day\"),\n    },\n    recentCandles: {\n      \"15m\": candles15m.slice(-10),\n      \"1h\": candles1h.slice(-10),\n      \"4h\": candles4h.slice(-10),\n      \"1day\": candles1day.slice(-10),\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        528,
+        -80
+      ],
+      "id": "276f6bee-740e-41c3-b843-fc8aa86a680d",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        752,
+        32
+      ],
+      "id": "8873a4ef-7870-4e10-bebd-009d3f129435",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        976,
+        32
+      ],
+      "id": "7ed8a801-cb2c-4770-b877-15bb35738907",
+      "name": "Aggregate1"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=** Purpose **\nYou are a professional day trader specializing in short-term technical analysis.\nBased on the pre-calculated technical indicators and sentiment analysis below, give one clear trading recommendation: BUY, SELL, or HOLD.\n\n** Ticker **\n{{ $json.data[0].ticker }}\n\n** Technical Indicators by Timeframe **\n15 Minute:\n{{ JSON.stringify($json.data[0].indicators[\"15m\"]) }}\n\n1 Hour:\n{{ JSON.stringify($json.data[0].indicators[\"1h\"]) }}\n\n4 Hour:\n{{ JSON.stringify($json.data[0].indicators[\"4h\"]) }}\n\n1 Day:\n{{ JSON.stringify($json.data[0].indicators[\"1day\"]) }}\n\n** Sentiment (Last 24-48h News) **\n{{ JSON.stringify($json.data[0].sentiment) }}\n\n** How to read the indicators **\nEach timeframe object includes:\n- rsi14: Relative Strength Index (>70 = overbought, <30 = oversold)\n- macd: { macd, signal, histogram } \u2014 bullish when macd > signal / histogram positive; bearish when reversed\n- ema20 / ema50: trend-following moving averages \u2014 price/ema20 above ema50 = bullish structure\n- atr14: Average True Range \u2014 use this to size realistic Stop-Loss and Target distances (do NOT guess arbitrary numbers)\n- trend: \"up\", \"down\", or \"sideways\" (pre-calculated from EMA20 vs EMA50 relationship)\n- vwap: Volume-weighted average price (may be null if volume data is unavailable for this asset \u2014 if null, ignore VWAP entirely, do not fabricate a value)\n\n** Decision process (follow in order) **\n1. Check 1day and 4h trend + RSI first \u2014 this establishes the higher-timeframe bias. Do not fight this bias without strong reason.\n2. Check 1h for confirmation \u2014 is momentum (MACD histogram) aligned with the higher-timeframe bias?\n3. Use 15m only for fine-tuning entry timing \u2014 not for overriding the broader trend.\n4. Cross-check sentiment score: if sentiment strongly contradicts the technical bias (e.g., strong uptrend but very negative sentiment), lower confidence and lean toward HOLD.\n5. Calculate Stop-Loss and Target using ATR from the timeframe you're basing entry on (e.g., Entry \u00b1 1.5x ATR for Stop-Loss, Entry \u00b1 2.5x ATR for Target) \u2014 never invent numbers unrelated to ATR or current price.\n6. If signals across timeframes strongly conflict with no clear majority, output HOLD.\n\n** Output Format (No explanation text!) **\n- Trade Action: BUY | SELL | HOLD\n- Entry Price: <number>\n- Stop-Loss: <number>\n- Target Price: <number>",
+        "options": {
+          "systemMessage": "=** Purpose **\nYou are a professional day trader specializing in short-term technical analysis.\nBased on the pre-calculated technical indicators and sentiment analysis below, give one clear trading recommendation: BUY, SELL, or HOLD.\n\n** Ticker **\n{{ $json.data[0].ticker }}\n\n** Technical Indicators by Timeframe **\n15 Minute:\n{{ JSON.stringify($json.data[0].indicators[\"15m\"]) }}\n\n1 Hour:\n{{ JSON.stringify($json.data[0].indicators[\"1h\"]) }}\n\n4 Hour:\n{{ JSON.stringify($json.data[0].indicators[\"4h\"]) }}\n\n1 Day:\n{{ JSON.stringify($json.data[0].indicators[\"1day\"]) }}\n\n** Sentiment (Last 24-48h News) **\n{{ JSON.stringify($json.data[0].sentiment) }}\n\n** How to read the indicators **\nEach timeframe object includes:\n- rsi14: Relative Strength Index (>70 = overbought, <30 = oversold)\n- macd: { macd, signal, histogram } \u2014 bullish when macd > signal / histogram positive; bearish when reversed\n- ema20 / ema50: trend-following moving averages \u2014 price/ema20 above ema50 = bullish structure\n- atr14: Average True Range \u2014 use this to size realistic Stop-Loss and Target distances (do NOT guess arbitrary numbers)\n- trend: \"up\", \"down\", or \"sideways\" (pre-calculated from EMA20 vs EMA50 relationship)\n- vwap: Volume-weighted average price (may be null if volume data is unavailable for this asset \u2014 if null, ignore VWAP entirely, do not fabricate a value)\n\n** Decision process (follow in order) **\n1. Check 1h and 30m trend + RSI first \u2014 this establishes the higher-timeframe bias. Do not fight this bias without strong reason.\n2. Check 15m for confirmation \u2014 is momentum (MACD histogram) aligned with the higher-timeframe bias?\n3. Use 1m only for fine-tuning entry timing \u2014 not for overriding the broader trend.\n4. Cross-check sentiment score: if sentiment strongly contradicts the technical bias (e.g., strong uptrend but very negative sentiment), lower confidence and lean toward HOLD.\n5. Calculate Stop-Loss and Target using ATR from the timeframe you're basing entry on (e.g., Entry \u00b1 1.5x ATR for Stop-Loss, Entry \u00b1 2.5x ATR for Target) \u2014 never invent numbers unrelated to ATR or current price.\n6. If signals across timeframes strongly conflict with no clear majority, output HOLD.\n\n** Output Format (No explanation text!) **\n- Trade Action: BUY | SELL | HOLD\n- Entry Price: <number>\n- Stop-Loss: <number>\n- Target Price: <number>\n\n- Always aim for a minimum 1:2 reward-to-risk ratio (Target distance at \n  least 2x the Stop-Loss distance from Entry).\n- Use ATR to size the Stop-Loss realistically first, then set the \n  Target at least 2x that distance, checking against recentCandles to \n  confirm the move is realistic given recent price range.\n- If a genuine 1:2 setup isn't realistically achievable right now, \n  output HOLD rather than forcing an unrealistic target."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1200,
+        32
+      ],
+      "id": "e9d2b3c0-8e14-4626-99fa-086f21ce1b06",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-opus-5",
+          "mode": "list",
+          "cachedResultName": "Claude Opus 5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        1280,
+        272
+      ],
+      "id": "4932dda3-a580-4be5-86dc-0b6aca3b7f9c",
+      "name": "Anthropic Chat Model",
+      "credentials": {
+        "anthropicApi": {
+          "id": "REDACTED",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawSymbol = $input.first().json.ticker;\n\n// Map common tickers to news-friendly search terms\nconst symbolMap = {\n  \"BTC/USD\": \"Bitcoin\",\n  \"ETH/USD\": \"Ethereum\",\n  \"XRP/USD\": \"Ripple XRP\",\n  \"EUR/USD\": \"EUR USD forex\",\n  \"GBP/USD\": \"GBP USD forex\",\n  \"USD/JPY\": \"USD JPY forex\",\n  \"AUD/USD\": \"AUD USD forex\",\n  \"XAU/USD\": \"Gold XAU forex\",\n  \"GBP/JPY\": \"GBP JPY forex\"\n};\n\nconst searchTerm = symbolMap[rawSymbol] || rawSymbol;\n\nreturn [{ json: { ticker: rawSymbol, searchTerm: searchTerm } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -272,
+        128
+      ],
+      "id": "de2b944e-0faf-4284-8355-060d1d789336",
+      "name": "Prepare News Query"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.content[0].text;\n\n// Strip markdown code fences if present\nconst cleaned = raw.replace(/```json\\n?/g, '').replace(/```/g, '').trim();\n\nlet parsed;\ntry {\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  parsed = {\n    shortTermSentiment: {\n      category: \"Neutral\",\n      score: 0,\n      rationale: \"Failed to parse sentiment response: \" + e.message\n    }\n  };\n}\n\nreturn [{\n  json: {\n    sentiment: parsed.shortTermSentiment || parsed\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        528,
+        208
+      ],
+      "id": "20814605-03c3-440f-80c8-1db3a67883a9",
+      "name": "Parse Sentiment"
+    },
+    {
+      "parameters": {
+        "jsCode": "const output = items[0].json.output;\n\nfunction extractNumber(text, label) {\n  const regex = new RegExp(label + \"\\\\s*:?\\\\s*([0-9]+\\\\.?[0-9]*)\", \"i\");\n  const match = text.match(regex);\n  return match ? parseFloat(match[1]) : null;\n}\n\nconst action = /BUY/i.test(output) ? \"BUY\" : /SELL/i.test(output) ? \"SELL\" : \"HOLD\";\nconst entry = extractNumber(output, \"Entry Price\");\nconst stopLoss = extractNumber(output, \"Stop-Loss\");\nconst target = extractNumber(output, \"Target Price\");\n\nlet rrRatio = null;\nlet warning = null;\n\nconst MINIMUM_RR = 2;\n\nif (entry && stopLoss && target && action !== \"HOLD\") {\n  const risk = Math.abs(entry - stopLoss);\n  const reward = Math.abs(target - entry);\n  rrRatio = (reward / risk).toFixed(2);\n\n  if (parseFloat(rrRatio) < MINIMUM_RR) {\n    warning = `\u26a0\ufe0f R:R is only 1:${rrRatio} \u2014 below the ${MINIMUM_RR} minimum. Weak setup, consider skipping.`;\n  }\n}\n\nconst now = new Date();\nconst utcHour = now.getUTCHours();\nlet session = \"Off-peak\";\nif (utcHour >= 13 && utcHour < 17) session = \"London/NY Overlap (high liquidity)\";\nelse if (utcHour >= 8 && utcHour < 13) session = \"London session\";\nelse if (utcHour >= 0 && utcHour < 9) session = \"Tokyo session\";\nelse if (utcHour >= 22 || utcHour < 1) session = \"Dead zone (low liquidity - use caution)\";\n\nreturn [{\n  json: {\n    ...items[0].json,\n    action,\n    entry,\n    stopLoss,\n    target,\n    rrRatio,\n    session,\n    warning\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1552,
+        32
+      ],
+      "id": "fd020b30-9f5e-40f7-bfb5-eae029ec409d",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -1264,
+        128
+      ],
+      "id": "917a0c05-8bb4-40ad-b74e-a208e720ca5c",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -832,
+        176
+      ],
+      "id": "ada5dbb0-9b80-4e2d-9154-6ab3197c918e",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "440ac36a-b804-48ce-80e6-e36c74d40705",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "HOLD",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            },
+            {
+              "id": "ed00ef5b-7dbf-4131-a838-fb99e71245fd",
+              "leftValue": "={{ Number($json.rrRatio) }}",
+              "rightValue": 1.5,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "fd58f1a4-fd22-4504-8cc7-0bc7f98db6d2",
+              "leftValue": "={{ $json.warning }}",
+              "rightValue": "",
+              "operator": {
+                "type": "number",
+                "operation": "empty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1776,
+        32
+      ],
+      "id": "05a4b951-d702-4974-8557-a65cc666e9ad",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://demo-api-capital.backend-capital.com/api/v1/session",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-CAP-API-KEY",
+              "value": "YOUR_CAPITAL_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n \"identifier\": \"YOUR_CAPITAL_IDENTIFIER\",\n \"password\": \"YOUR_CAPITAL_PASSWORD\"\n}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2000,
+        32
+      ],
+      "id": "63d24c21-52ac-4713-b4ca-9880bfa0cac8",
+      "name": "Capital.com Login node"
+    },
+    {
+      "parameters": {
+        "chatId": "2092435796",
+        "text": "=\ud83e\udd16 Trade Executed Automatically  \ud83d\udcca Pair: {{ $('Aggregate1').first().json.data[0].ticker }} \ud83d\udcc8 Direction: {{ $('Code in JavaScript1').first().json.action }} \ud83c\udfaf Entry: {{ $('Code in JavaScript1').first().json.entry }} \ud83d\uded1 Stop-Loss: {{ $('Code in JavaScript1').first().json.stopLoss }} \ud83d\udcb0 Target: {{ $('Code in JavaScript1').first().json.target }} \u2696\ufe0f R:R Ratio: {{ $('Code in JavaScript1').first().json.rrRatio }} \ud83d\udd50 Session: {{ $('Code in JavaScript1').first().json.session }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3568,
+        304
+      ],
+      "id": "f2f0a500-d567-4ea9-aa74-bcaa4cbe531f",
+      "name": "Send a text message",
+      "webhookId": "aae9cb21-d6aa-4c70-af48-9261755e38f0",
+      "credentials": {
+        "telegramApi": {
+          "id": "REDACTED",
+          "name": "Telegram account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://demo-api-capital.backend-capital.com/api/v1/positions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-SECURITY-TOKEN",
+              "value": "={{ $('Capital.com Login node').first().json.headers[\"x-security-token\"] }}"
+            },
+            {
+              "name": "CST",
+              "value": "={{ $('Capital.com Login node').first().json.headers[\"cst\"] }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2224,
+        32
+      ],
+      "id": "8cb979b9-29cc-4be5-a6d2-9f11874231cd",
+      "name": "Check Open Positions"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "b556b098-ff68-4eef-bf02-fd14dd2181af",
+              "leftValue": "={{ $json.positions.filter(p => p.position.epic === $('Aggregate1').first().json.data[0].epicCode).length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2448,
+        32
+      ],
+      "id": "027f85c2-3164-448d-b320-43156b920f9f",
+      "name": "Does an open position already exist for this pair?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://demo-api-capital.backend-capital.com/api/v1/positions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-SECURITY-TOKEN",
+              "value": "={{ $('Capital.com Login node').first().json.headers[\"x-security-token\"] }}"
+            },
+            {
+              "name": "CST",
+              "value": "={{ $('Capital.com Login node').first().json.headers[\"cst\"] }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.order) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        3344,
+        32
+      ],
+      "id": "7b0f9796-187e-49f2-ad72-182a6e3d6bcd",
+      "name": "Trade executions",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const epic = $('Aggregate1').first().json.data[0].epicCode;\nconst ai = $('Code in JavaScript1').first().json;\n\nconst MARGIN_PCT_OF_FUNDS = 0.5; // 50% of available funds\nconst CAPITAL_EPIC = { XAUUSD: 'GOLD' };\n\n// Real leverage your demo account uses (check the \"Leverage\" column in your portfolio)\nconst LEVERAGE = {\n  EURUSD: 100,\n  GBPUSD: 100,\n  GBPJPY: 100,\n  XAUUSD: 100,\n  BTCUSD: 20,\n};\n\n// ---- Available funds ----\nconst accounts = $('Get Balance').first().json.accounts || [];\nconst acct = accounts.find(a => a.preferred) || accounts[0];\nconst bal = acct?.balance || {};\n\nlet available = Number(bal.available);\nif (!(available > 0)) available = Number(bal.balance);\nif (!(available > 0)) available = Number(bal.deposit);\nif (!(available > 0)) throw new Error('No funds found: ' + JSON.stringify(bal));\n\n// ---- Market rules (min size, step, max size) ----\nconst m = $('Get Market Rules').first().json;\nconst minSize = Number(m.dealingRules?.minDealSize?.value);\nconst maxSize = Number(m.dealingRules?.maxDealSize?.value) || Infinity;\nconst step = Number(m.dealingRules?.minSizeIncrement?.value) || minSize;\nconst price = Number(m.snapshot?.offer) || Number(ai.entry);\n\n// ---- Leverage: use our table, fall back to the API rate ----\nlet leverage = LEVERAGE[epic];\nlet leverageSource = 'table';\nif (!leverage) {\n  const mf = Number(m.instrument?.marginFactor);\n  leverage = mf ? 100 / mf : NaN;\n  leverageSource = 'api';\n}\n\nif (!minSize || !leverage || !price) {\n  throw new Error(`Missing market rules for ${epic}: ` + JSON.stringify({ minSize, leverage, price }));\n}\n\nconst quoteUsd = epic.endsWith('JPY') ? 1 / 150 : 1;\nconst marginPerUnitUsd = (price * quoteUsd) / leverage;\n\n// ---- Size ----\nlet size = (available * MARGIN_PCT_OF_FUNDS) / marginPerUnitUsd;\nconst decimals = (String(step).split('.')[1] || '').length;\nsize = Math.floor(size / step + 1e-9) * step;\nsize = Number(size.toFixed(decimals));\n\nlet usedMinimum = false;\nif (size < minSize) { size = minSize; usedMinimum = true; }\nsize = Math.min(size, maxSize);\n\nconst marginNeeded = size * marginPerUnitUsd;\nif (marginNeeded > available) {\n  throw new Error(`Not enough free funds for minimum ${epic}: need ~$${marginNeeded.toFixed(2)}, have $${available}`);\n}\n\n// ---- Build the order ----\nconst direction = String(ai.action || '').toUpperCase();\nconst stopLevel = Number(ai.stopLoss);\nconst profitLevel = Number(ai.target);\n\nif (!['BUY', 'SELL'].includes(direction)) {\n  throw new Error(`Bad direction for ${epic}: ${JSON.stringify(ai)}`);\n}\nif (!(stopLevel > 0) || !(profitLevel > 0)) {\n  throw new Error(`Bad stop/target for ${epic}: ${JSON.stringify(ai)}`);\n}\n\nconst order = {\n  epic: CAPITAL_EPIC[epic] || epic,\n  direction,\n  size,\n  guaranteedStop: false,\n  stopLevel,\n  profitLevel,\n};\n\nreturn [{ json: {\n  size, usedMinimum, leverage, leverageSource,\n  marginUsd: Number(marginNeeded.toFixed(2)),\n  available, order\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        32
+      ],
+      "id": "4280d484-e103-4c7d-bebe-6a0cefb730f6",
+      "name": "Code in JavaScript3"
+    },
+    {
+      "parameters": {
+        "amount": 40
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -576,
+        240
+      ],
+      "id": "cb44dc5e-d42d-42b3-8514-4c5d5f45eb40",
+      "name": "Wait",
+      "webhookId": "9b2b2766-c8af-4633-b31b-43f3b1411d37"
+    },
+    {
+      "parameters": {
+        "jsCode": "const pairs = [\n  { ticker: \"EUR/USD\", epicCode: \"EURUSD\" },\n  { ticker: \"GBP/USD\", epicCode: \"GBPUSD\" },\n  { ticker: \"XAU/USD\", epicCode: \"XAUUSD\" },\n{ ticker: \"BTC/USD\", epicCode: \"BTCUSD\" },\n{ ticker: \"GBP/JPY\", epicCode: \"GBPJPY\" },\n];\n\nreturn pairs.map(pair => ({ json: pair }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1056,
+        368
+      ],
+      "id": "1b14cc56-0019-4819-a1a3-ed95f6604740",
+      "name": "The 5 pairs"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        768
+      ],
+      "id": "e50cc7a0-8566-4ac3-8f42-e9c3a0331127",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "url": "https://demo-api-capital.backend-capital.com/api/v1/accounts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-SECURITY-TOKEN",
+              "value": "={{ $('Capital.com Login node').item.json.headers['x-security-token'] }}"
+            },
+            {
+              "name": "CST",
+              "value": "={{ $('Capital.com Login node').item.json.headers.cst }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2672,
+        32
+      ],
+      "id": "06cee4cc-5de1-402b-81a9-45afef21e36a",
+      "name": "Get Balance"
+    },
+    {
+      "parameters": {
+        "url": "=https://demo-api-capital.backend-capital.com/api/v1/markets/{{ ({XAUUSD:'GOLD'})[$('Aggregate1').first().json.data[0].epicCode] || $('Aggregate1').first().json.data[0].epicCode }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-SECURITY-TOKEN",
+              "value": "={{ $('Capital.com Login node').item.json.headers['x-security-token'] }}"
+            },
+            {
+              "name": "CST",
+              "value": "={{ $('Capital.com Login node').item.json.headers.cst }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2896,
+        32
+      ],
+      "id": "53770d19-82fd-46d0-9b01-a9e30063bbf7",
+      "name": "Get Market Rules",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://api.twelvedata.com/time_series",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{ $json.ticker }}"
+            },
+            {
+              "name": "interval",
+              "value": "15min"
+            },
+            {
+              "name": "outputsize",
+              "value": "100"
+            },
+            {
+              "name": "apikey",
+              "value": "YOUR_TWELVE_DATA_API_KEY"
+            },
+            {
+              "name": "exchange",
+              "value": "Binance"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -272,
+        -272
+      ],
+      "id": "f8c09aed-e9c3-4125-8d18-c690e70e1484",
+      "name": "15 minute interval1"
+    },
+    {
+      "parameters": {
+        "url": "https://api.twelvedata.com/time_series",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{ $json.ticker }}"
+            },
+            {
+              "name": "interval",
+              "value": "1h"
+            },
+            {
+              "name": "outputsize",
+              "value": "100"
+            },
+            {
+              "name": "apikey",
+              "value": "YOUR_TWELVE_DATA_API_KEY"
+            },
+            {
+              "name": "exchange",
+              "value": "Binance"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -272,
+        -80
+      ],
+      "id": "4e5664b7-7997-4902-937d-5112163c157e",
+      "name": "1h minute interval"
+    },
+    {
+      "parameters": {
+        "url": "https://api.twelvedata.com/time_series",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{ $('The 5 pairs').first().json.ticker }}"
+            },
+            {
+              "name": "interval",
+              "value": "4h"
+            },
+            {
+              "name": "outputsize",
+              "value": "100"
+            },
+            {
+              "name": "apikey",
+              "value": "YOUR_TWELVE_DATA_API_KEY"
+            },
+            {
+              "name": "exchange",
+              "value": "Binance"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -272,
+        320
+      ],
+      "id": "206009a7-7acf-4351-a039-cb9164b766c7",
+      "name": "4h interval"
+    },
+    {
+      "parameters": {
+        "url": "https://api.twelvedata.com/time_series",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{ $json.ticker }}"
+            },
+            {
+              "name": "interval",
+              "value": "1day"
+            },
+            {
+              "name": "outputsize",
+              "value": "100"
+            },
+            {
+              "name": "apikey",
+              "value": "YOUR_TWELVE_DATA_API_KEY"
+            },
+            {
+              "name": "exchange",
+              "value": "Binance"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -272,
+        512
+      ],
+      "id": "bce5e38a-e3ea-43a1-8e9a-7592850cac2c",
+      "name": "1day interval"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "GETNEWS": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Parse Sentiment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Aggregate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "Aggregate1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare News Query": {
+      "main": [
+        [
+          {
+            "node": "GETNEWS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Sentiment": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "The 5 pairs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Capital.com Login node",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capital.com Login node": {
+      "main": [
+        [
+          {
+            "node": "Check Open Positions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Open Positions": {
+      "main": [
+        [
+          {
+            "node": "Does an open position already exist for this pair?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Does an open position already exist for this pair?": {
+      "main": [
+        [
+          {
+            "node": "Get Balance",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trade executions": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript3": {
+      "main": [
+        [
+          {
+            "node": "Trade executions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a text message": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "15 minute interval1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "1h minute interval",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare News Query",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "4h interval",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "1day interval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "The 5 pairs": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Balance": {
+      "main": [
+        [
+          {
+            "node": "Get Market Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Market Rules": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "15 minute interval1": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1h minute interval": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "4h interval": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "1day interval": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "timezone": "Africa/Lagos",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "075658fc-619d-42f7-8482-d7ec27f02e49",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "REDACTED_INSTANCE_ID"
+  },
+  "nodeGroups": [],
+  "id": "xNJn3aDqgne7NdEb",
+  "tags": []
+}
